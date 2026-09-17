@@ -1,85 +1,53 @@
 import { NextResponse } from 'next/server';
-import pool from '@/lib/db';
+import { Pool } from 'pg';
 
-export async function POST(req: Request) {
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: { rejectUnauthorized: false },
+});
+
+export async function GET(request: Request) {
   try {
-    const { source, records } = await req.json();
-
-    if (!records || !Array.isArray(records) || records.length === 0) {
-      return NextResponse.json({ error: 'No records provided' }, { status: 400 });
-    }
+    const { searchParams } = new URL(request.url);
+    const range = searchParams.get('range') || '14'; // default to 14 days
 
     const client = await pool.connect();
     
-    try {
-      // Start a SQL Transaction
-      await client.query('BEGIN');
+    // Fetch aggregate statistics from daily_metrics
+    const summaryResult = await client.query(`
+      SELECT 
+        COUNT(*) as total_days,
+        SUM(steps) as lifetime_steps,
+        ROUND(AVG(steps)) as avg_daily_steps,
+        SUM(distance_km) as total_distance,
+        ROUND(AVG(recovery_score)) as avg_recovery,
+        ROUND(AVG(strain), 1) as avg_strain,
+        ROUND(AVG(sleep_duration_mins) / 60.0, 1) as avg_sleep_hours
+      FROM daily_metrics;
+    `);
 
-      let upsertedCount = 0;
-      let errors = [];
+    // Fetch recent records based on the selected range
+    let recentQuery = `
+      SELECT date, steps, recovery_score, strain, sleep_duration_mins
+      FROM daily_metrics
+      ORDER BY date DESC
+    `;
 
-      for (const record of records) {
-        try {
-          if (source === 'pacer') {
-            const query = `
-              INSERT INTO daily_metrics (date, steps, distance_km, active_time_mins)
-              VALUES ($1, $2, $3, $4)
-              ON CONFLICT (date) DO UPDATE SET
-                steps = EXCLUDED.steps,
-                distance_km = EXCLUDED.distance_km,
-                active_time_mins = EXCLUDED.active_time_mins,
-                updated_at = CURRENT_TIMESTAMP;
-            `;
-            await client.query(query, [record.date, record.steps, record.distance_km, record.active_time_mins]);
-            upsertedCount++;
-          } else if (source === 'whoop') {
-            const query = `
-              INSERT INTO daily_metrics (
-                date, recovery_score, strain, rhr, hrv, 
-                sleep_duration_mins, sleep_performance, calories_burned
-              )
-              VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-              ON CONFLICT (date) DO UPDATE SET
-                recovery_score = EXCLUDED.recovery_score,
-                strain = EXCLUDED.strain,
-                rhr = EXCLUDED.rhr,
-                hrv = EXCLUDED.hrv,
-                sleep_duration_mins = EXCLUDED.sleep_duration_mins,
-                sleep_performance = EXCLUDED.sleep_performance,
-                calories_burned = EXCLUDED.calories_burned,
-                updated_at = CURRENT_TIMESTAMP;
-            `;
-            await client.query(query, [
-              record.date, record.recovery_score, record.strain, record.rhr, 
-              record.hrv, record.sleep_duration_mins, record.sleep_performance, record.calories_burned
-            ]);
-            upsertedCount++;
-          }
-        } catch (err) {
-          // If a single row fails, log it but don't crash the whole import
-          errors.push({ record, error: (err as Error).message });
-        }
-      }
-
-      // Log the ingestion metrics to prove data quality
-      const logQuery = `
-        INSERT INTO import_logs (data_source, records_processed, records_upserted, errors)
-        VALUES ($1, $2, $3, $4)
-      `;
-      await client.query(logQuery, [source, records.length, upsertedCount, JSON.stringify(errors)]);
-
-      // Commit transaction
-      await client.query('COMMIT');
-      
-      return NextResponse.json({ success: true, processed: records.length, upserted: upsertedCount, errors });
-    } catch (error) {
-      await client.query('ROLLBACK');
-      throw error;
-    } finally {
-      client.release();
+    let queryParams: any[] = [];
+    if (range !== 'all') {
+      recentQuery += ` LIMIT $1`;
+      queryParams.push(parseInt(range, 10));
     }
-  } catch (error) {
-    console.error('Import API Error:', error);
-    return NextResponse.json({ error: 'Server error during import' }, { status: 500 });
+
+    const recentResult = await client.query(recentQuery, queryParams);
+    client.release();
+
+    return NextResponse.json({
+      summary: summaryResult.rows[0],
+      recent: recentResult.rows.reverse(), // Chronological order for charts
+    });
+  } catch (error: any) {
+    console.error('Metrics API Error:', error);
+    return NextResponse.json({ error: error.message }, { status: 500 });
   }
 }
